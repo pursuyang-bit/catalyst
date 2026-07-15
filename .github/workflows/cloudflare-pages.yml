@@ -1,0 +1,64 @@
+name: Daily CatDesk 9 to Cloudflare Pages
+
+on:
+  workflow_dispatch:
+    inputs:
+      report_date:
+        description: "Optional report date, YYYY-MM-DD"
+        required: false
+        type: string
+  schedule:
+    # 09:05 Asia/Shanghai, Monday-Friday (exclude weekends)
+    - cron: "5 1 * * 1-5"
+
+permissions:
+  contents: read
+  deployments: write
+
+concurrency:
+  group: cloudflare-pages-catdesk9
+  cancel-in-progress: false
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      TZ: Asia/Shanghai
+      PYTHONPATH: src
+      CATDESK_INLINE_CSS: "1"
+      CATDESK_REPORT_DATE: ${{ github.event.inputs.report_date || '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build static site shell
+        run: python scripts/build_static_site.py
+
+      - name: Build and inject daily report
+        run: |
+          report_date="${CATDESK_REPORT_DATE:-$(date +%F)}"
+          mkdir -p reports-web
+          if ! timeout 10m python -m ashare_us_catalyst.cli --date "$report_date" --top 5 --max-themes 6 --output reports-web --cache .cache-static; then
+            echo "::warning::Full daily report build failed or timed out; retrying without news."
+            timeout 5m python -m ashare_us_catalyst.cli --date "$report_date" --top 5 --max-themes 6 --output reports-web --cache .cache-static --skip-news
+          fi
+          python scripts/inject_report_into_dist.py --report-date "$report_date" --reports-dir reports-web
+
+      - name: Publish to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy dist --project-name=${{ secrets.CLOUDFLARE_PAGES_PROJECT_NAME }}
